@@ -1,0 +1,2 @@
+# kzr_OpenPLC_FUXA_SampleProjects
+OpenPLC＆FUXAで天気予報を表示するサンプルプロジェクト

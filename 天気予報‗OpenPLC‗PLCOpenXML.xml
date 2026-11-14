@@ -1,0 +1,3414 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project xmlns="http://www.plcopen.org/xml/tc6_0201" xmlns:xsd="http://www.w3.org/2001/XMLSchema-instance" xmlns:xhtml="http://www.w3.org/1999/xhtml" xmlns:ns1="http://www.plcopen.org/xml/tc6_0201">
+  <fileHeader companyName="Unknown" productName="Unnamed" productVersion="1" creationDateTime="2026-11-14T15:36:58"/>
+  <contentHeader name="Unnamed" modificationDateTime="2026-11-14T15:36:58">
+    <coordinateInfo>
+      <fbd>
+        <scaling x="16" y="16"/>
+      </fbd>
+      <ld>
+        <scaling x="16" y="16"/>
+      </ld>
+      <sfc>
+        <scaling x="16" y="16"/>
+      </sfc>
+    </coordinateInfo>
+  </contentHeader>
+  <types>
+    <dataTypes/>
+    <pous>
+      <pou name="FB_GetGamepad" pouType="functionBlock">
+        <interface>
+          <outputVars>
+            <variable name="axis_lx">
+              <type>
+                <REAL/>
+              </type>
+              <initialValue>
+                <simpleValue value="0.0"/>
+              </initialValue>
+            </variable>
+            <variable name="axis_ly">
+              <type>
+                <REAL/>
+              </type>
+              <initialValue>
+                <simpleValue value="0.0"/>
+              </initialValue>
+            </variable>
+            <variable name="axis_rx">
+              <type>
+                <REAL/>
+              </type>
+              <initialValue>
+                <simpleValue value="0.0"/>
+              </initialValue>
+            </variable>
+            <variable name="axis_ry">
+              <type>
+                <REAL/>
+              </type>
+              <initialValue>
+                <simpleValue value="0.0"/>
+              </initialValue>
+            </variable>
+            <variable name="btn_cross">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+            <variable name="btn_circle">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+            <variable name="btn_square">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+            <variable name="btn_triangle">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+            <variable name="btn_l1">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+            <variable name="btn_r1">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+            <variable name="axis_l2">
+              <type>
+                <REAL/>
+              </type>
+              <initialValue>
+                <simpleValue value="0.0"/>
+              </initialValue>
+            </variable>
+            <variable name="axis_r2">
+              <type>
+                <REAL/>
+              </type>
+              <initialValue>
+                <simpleValue value="0.0"/>
+              </initialValue>
+            </variable>
+            <variable name="dpad_x">
+              <type>
+                <SINT/>
+              </type>
+              <initialValue>
+                <simpleValue value="0"/>
+              </initialValue>
+            </variable>
+            <variable name="dpad_y">
+              <type>
+                <SINT/>
+              </type>
+              <initialValue>
+                <simpleValue value="0"/>
+              </initialValue>
+            </variable>
+            <variable name="connected">
+              <type>
+                <BOOL/>
+              </type>
+              <initialValue>
+                <simpleValue value="FALSE"/>
+              </initialValue>
+            </variable>
+          </outputVars>
+        </interface>
+        <body>
+          <ST>
+            <xhtml:p><![CDATA["""
+FB_GetGamepad (pygame 不要版)
+
+Linux の joystick API (/dev/input/js*) を標準ライブラリだけで直接読む。
+外部パッケージのインストールは不要。
+
+ボタン・軸番号は Linux カーネルドライバ (hid-playstation / hid-sony) の
+DualSense / DualShock4 の割り当て。違うコントローラの場合は
+ホスト側で `jstest /dev/input/js0` を実行して番号を確認し、下の定数を直す。
+"""
+# ↓ この2つは OpenPLC が付け足す共有メモリ処理が使うので消さないこと
+from multiprocessing import shared_memory
+import struct
+
+import os
+import glob
+import time
+import select
+import threading
+
+# ---- 設定 -------------------------------------------------------------
+# 環境変数 GAMEPAD_DEVICE でデバイスを固定可能 (例: /dev/input/js0)
+DEADZONE = 0.05
+
+# 軸番号 (Linux joydev, PS4/PS5 コントローラ)
+AXIS_LX, AXIS_LY = 0, 1
+AXIS_L2 = 2
+AXIS_RX, AXIS_RY = 3, 4
+AXIS_R2 = 5
+AXIS_HAT_X, AXIS_HAT_Y = 6, 7
+
+# ボタン番号 (Linux joydev, PS4/PS5 コントローラ)
+BTN_CROSS = 0
+BTN_CIRCLE = 1
+BTN_TRIANGLE = 2
+BTN_SQUARE = 3
+BTN_L1 = 4
+BTN_R1 = 5
+# ----------------------------------------------------------------------
+
+# struct js_event { __u32 time; __s16 value; __u8 type; __u8 number; }
+_EVENT_FMT = '<IhBB'
+_EVENT_SIZE = struct.calcsize(_EVENT_FMT)  # 8 bytes
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+
+_lock = threading.Lock()
+_thread_running = False
+
+_DEFAULT_STATE = {
+    'connected':    False,
+    'axis_lx':      0.0,
+    'axis_ly':      0.0,
+    'axis_rx':      0.0,
+    'axis_ry':      0.0,
+    'axis_l2':      0.0,
+    'axis_r2':      0.0,
+    'btn_cross':    False,
+    'btn_circle':   False,
+    'btn_square':   False,
+    'btn_triangle': False,
+    'btn_l1':       False,
+    'btn_r1':       False,
+    'dpad_x':       0,
+    'dpad_y':       0,
+}
+_state = dict(_DEFAULT_STATE)
+
+_AXIS_MAP = {
+    AXIS_LX: 'axis_lx',
+    AXIS_LY: 'axis_ly',
+    AXIS_RX: 'axis_rx',
+    AXIS_RY: 'axis_ry',
+}
+_TRIGGER_MAP = {
+    AXIS_L2: 'axis_l2',
+    AXIS_R2: 'axis_r2',
+}
+_BUTTON_MAP = {
+    BTN_CROSS:    'btn_cross',
+    BTN_CIRCLE:   'btn_circle',
+    BTN_SQUARE:   'btn_square',
+    BTN_TRIANGLE: 'btn_triangle',
+    BTN_L1:       'btn_l1',
+    BTN_R1:       'btn_r1',
+}
+
+
+def _apply_deadzone(value, deadzone=DEADZONE):
+    if abs(value) < deadzone:
+        return 0.0
+    return value
+
+
+def _norm(raw):
+    """-32767..32767 → -1.0..1.0"""
+    return max(-1.0, min(1.0, raw / 32767.0))
+
+
+def _sign(raw):
+    return (raw > 0) - (raw < 0)
+
+
+def _find_device():
+    path = os.environ.get('GAMEPAD_DEVICE')
+    if path:
+        return path if os.path.exists(path) else None
+    devices = sorted(glob.glob('/dev/input/js*'))
+    return devices[0] if devices else None
+
+
+def _reset_state():
+    with _lock:
+        _state.update(_DEFAULT_STATE)
+
+
+def _handle_event(value, etype, number):
+    etype &= ~JS_EVENT_INIT  # 初期状態通知も通常イベントとして扱う
+    with _lock:
+        if etype == JS_EVENT_AXIS:
+            if number in _AXIS_MAP:
+                _state[_AXIS_MAP[number]] = _apply_deadzone(_norm(value))
+            elif number in _TRIGGER_MAP:
+                _state[_TRIGGER_MAP[number]] = (_norm(value) + 1.0) / 2.0  # 0~1
+            elif number == AXIS_HAT_X:
+                _state['dpad_x'] = _sign(value)
+            elif number == AXIS_HAT_Y:
+                # joydev は上が負・下が正 → PLC側の「下が+」とそのまま一致
+                _state['dpad_y'] = _sign(value)
+        elif etype == JS_EVENT_BUTTON:
+            if number in _BUTTON_MAP:
+                _state[_BUTTON_MAP[number]] = bool(value)
+
+
+def _poll():
+    fd = None
+    while _thread_running:
+        # --- 接続 / 再接続 ---
+        if fd is None:
+            path = _find_device()
+            if path is None:
+                time.sleep(1.0)
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                print(f'FB_GetGamepad: cannot open {path}: {e}', flush=True)
+                time.sleep(1.0)
+                continue
+            print(f'FB_GetGamepad: connected {path}', flush=True)
+            with _lock:
+                _state['connected'] = True
+
+        # --- イベント読み取り ---
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if not ready:
+                continue
+            data = os.read(fd, _EVENT_SIZE * 64)
+            if not data:
+                raise OSError('device closed')
+            for off in range(0, len(data) - _EVENT_SIZE + 1, _EVENT_SIZE):
+                _t, value, etype, number = struct.unpack_from(_EVENT_FMT, data, off)
+                _handle_event(value, etype, number)
+        except BlockingIOError:
+            continue
+        except OSError as e:
+            print(f'FB_GetGamepad: disconnected ({e})', flush=True)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd = None
+            _reset_state()
+            time.sleep(1.0)
+
+    if fd is not None:
+        os.close(fd)
+
+
+def block_init():
+    global _thread_running
+    _thread_running = True
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    print('FB_GetGamepad: initialized', flush=True)
+
+
+def block_loop():
+    global connected
+    global axis_lx, axis_ly, axis_rx, axis_ry
+    global axis_l2, axis_r2
+    global btn_cross, btn_circle, btn_square, btn_triangle
+    global btn_l1, btn_r1
+    global dpad_x, dpad_y
+
+    with _lock:
+        connected    = _state['connected']
+        axis_lx      = _state['axis_lx']
+        axis_ly      = _state['axis_ly']
+        axis_rx      = _state['axis_rx']
+        axis_ry      = _state['axis_ry']
+        axis_l2      = _state['axis_l2']
+        axis_r2      = _state['axis_r2']
+        btn_cross    = _state['btn_cross']
+        btn_circle   = _state['btn_circle']
+        btn_square   = _state['btn_square']
+        btn_triangle = _state['btn_triangle']
+        btn_l1       = _state['btn_l1']
+        btn_r1       = _state['btn_r1']
+        dpad_x       = _state['dpad_x']
+        dpad_y       = _state['dpad_y']]]></xhtml:p>
+          </ST>
+        </body>
+        <documentation>
+          <xhtml:p><![CDATA[ ]]></xhtml:p>
+        </documentation>
+      </pou>
+      <pou name="FB_GetTime" pouType="functionBlock">
+        <interface>
+          <outputVars>
+            <variable name="year">
+              <type>
+                <UINT/>
+              </type>
+            </variable>
+            <variable name="month">
+              <type>
+                <UINT/>
+              </type>
+            </variable>
+            <variable name="day">
+              <type>
+                <UINT/>
+              </type>
+            </variable>
+            <variable name="hour">
+              <type>
+                <UINT/>
+              </type>
+            </variable>
+            <variable name="minute">
+              <type>
+                <UINT/>
+              </type>
+            </variable>
+            <variable name="second">
+              <type>
+                <UINT/>
+              </type>
+            </variable>
+          </outputVars>
+        </interface>
+        <body>
+          <ST>
+            <xhtml:p><![CDATA[/* ================================================================
+ *  C/C++ FUNCTION BLOCK
+ *
+ *  ---------------------------------------------------------------
+ *  - This function block runs **in sync** with the PLC runtime.
+ *  - The `setup()` function is called once when the block initializes.
+ *  - The `loop()` function is called at every PLC scan cycle.
+ *  - Block input and output variables declared in the variable table
+ *    can be accessed directly by name in this C/C++ code.
+ *
+ *  This block executes as part of the main PLC process and follows
+ *  the configured scan time in the Resources. Use it for real-time
+ *  control logic, fast I/O operations, or any C-based algorithms.
+ * ================================================================ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h> // Library for managing date/time
+// Called once when the block is initialized
+void setup()
+{
+}
+// Called at every PLC scan cycle
+void loop()
+{
+// Get the current system time
+time_t t = time(NULL);
+struct tm *tm_info = localtime(&t); // Convert to local time
+// Get year, month, day, hour, minute, second
+year = tm_info->tm_year + 1900; // tm_year is years since 1900
+month = tm_info->tm_mon + 1; // tm_mon is 0-11
+day = tm_info->tm_mday; // Day of the month 1-31
+hour = tm_info->tm_hour; // 0-23
+minute = tm_info->tm_min; // 0-59
+second = tm_info->tm_sec; // 0-59
+}]]></xhtml:p>
+          </ST>
+        </body>
+        <documentation>
+          <xhtml:p><![CDATA[ ]]></xhtml:p>
+        </documentation>
+      </pou>
+      <pou name="FB_GetWeather" pouType="functionBlock">
+        <interface>
+          <inputVars>
+            <variable name="xTrig">
+              <type>
+                <BOOL/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[立ち上がりで取得開始]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="udID">
+              <type>
+                <UDINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[地域ID (6桁。例: 130010=東京, 016010=札幌 は 16010 と入力してよい)]]></xhtml:p>
+              </documentation>
+            </variable>
+          </inputVars>
+          <outputVars>
+            <variable name="xBusy">
+              <type>
+                <BOOL/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[通信中]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="xValid">
+              <type>
+                <BOOL/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[直近の取得に成功し、出力が有効]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="xError">
+              <type>
+                <BOOL/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[直近の取得に失敗]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iErrorCode">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[0=正常 1=ID不正 2=HTTPエラー 3=通信失敗/タイムアウト 4=JSON解析失敗]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="xInterlock">
+              <type>
+                <BOOL/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[インターロック中 (この間の xTrig は無視)]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iInterlockRemain">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[インターロック残り秒]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="udUpdateCount">
+              <type>
+                <UDINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[取得成功のたびに +1 (PLC側で変化を見れば完了検出できる)]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="uiCodeD0">
+              <type>
+                <UINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[今日]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="uiCodeD1">
+              <type>
+                <UINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明日]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="uiCodeD2">
+              <type>
+                <UINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明後日]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iTempMaxD0">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[今日]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iTempMaxD1">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明日]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iTempMaxD2">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明後日]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD0_00">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[今日 0-6時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD0_06">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[今日 6-12時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD0_12">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[今日 12-18時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD0_18">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[今日 18-24時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD1_00">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明日 0-6時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD1_06">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明日 6-12時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD1_12">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明日 12-18時]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iRainD1_18">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[明日 18-24時]]></xhtml:p>
+              </documentation>
+            </variable>
+          </outputVars>
+        </interface>
+        <body>
+          <ST>
+            <xhtml:p><![CDATA[# ================================================================
+# DISCLAIMER: Python Function Block Execution
+#
+# This block runs asynchronously from the main PLC runtime.
+# ---------------------------------------------------------------
+# - All variables are shared with the runtime through shared memory.
+# - The block_init() function is called once when the block starts.
+# - The block_loop() function is called periodically (~100ms).
+# - IMPORTANT: This periodic call DOES NOT follow the PLC scan cycle.
+#   It is NOT guaranteed that block_loop() will execute once per scan.
+#
+# Use this block for non-time-critical tasks. For logic that must
+# match the PLC scan cycle, use standard IEC 61131-3 function blocks.
+# ================================================================
+
+# 天気予報 API (https://weather.tsukumijima.net/) から予報を取得し、
+# PLC で扱いやすい型に変換して出力する。標準ライブラリのみ使用。
+#
+# 出力の D0=今日 D1=明日 D2=明後日
+#   uiCodeD0..D2     : UINT  天気コード (気象庁アイコン番号 100=晴 200=曇 300=雨 400=雪)  無し=0
+#   iTempMaxD0..D2   : INT   最高気温 [0.01℃] (18℃ → 1800)                              無し=-32768
+#   iRainD0_00..D1_18: INT   降水確率 [%] 6時間ごと (_00=0-6時 _06=6-12時 _12=12-18時 _18=18-24時)
+#                                                                           無し(過去の時間帯など)=-1
+
+# ↓ この2つは OpenPLC が付け足す共有メモリ処理が使うので消さないこと
+from multiprocessing import shared_memory
+import struct
+
+import os
+import json
+import time
+import threading
+import urllib.request
+import urllib.error
+
+# ---- 設定 -------------------------------------------------------------
+API_URL = 'https://weather.tsukumijima.net/api/forecast/city/{:06d}'
+USER_AGENT = 'OpenPLC-FB_GetWeather/1.0'
+TIMEOUT_S = 10
+
+# 送信してから次の送信を許可するまでの最小間隔[秒]。
+# PLC側から変更できないようにここで固定している (サーバー保護のため)。
+MIN_INTERVAL_S = 60
+
+# 最終送信時刻の保存先。PLCを停止→再開しても(コンテナ内では)インターロックが続く
+LAST_SEND_FILE = '/tmp/fb_getweather_last_send'
+# ----------------------------------------------------------------------
+
+NO_CODE = 0          # UINT なので 0 を「無し」とする (天気コードは100以上)
+NO_TEMP = -32768     # INT の最小値を「無し」とする
+NO_RAIN = -1
+
+ERR_OK = 0
+ERR_BAD_ID = 1
+ERR_HTTP = 2
+ERR_NETWORK = 3
+ERR_PARSE = 4
+
+_RAIN_SLOTS = (('00', 'T00_06'), ('06', 'T06_12'), ('12', 'T12_18'), ('18', 'T18_24'))
+
+_lock = threading.Lock()
+_busy = False
+_prev_trig = None          # None = 起動後まだ一度も見ていない
+_last_send = 0.0           # time.time() 基準
+
+_WEATHER_DEFAULT = {}
+for _d in range(3):
+    _WEATHER_DEFAULT[f'uiCodeD{_d}'] = NO_CODE
+    _WEATHER_DEFAULT[f'iTempMaxD{_d}'] = NO_TEMP
+for _d in range(2):
+    for _slot, _key in _RAIN_SLOTS:
+        _WEATHER_DEFAULT[f'iRainD{_d}_{_slot}'] = NO_RAIN
+
+_state = {
+    'xValid':        False,
+    'xError':        False,
+    'iErrorCode':    ERR_OK,
+    'udUpdateCount': 0,
+}
+_state.update(_WEATHER_DEFAULT)
+
+
+# ---- 変換ヘルパ --------------------------------------------------------
+def _to_temp(t):
+    """{'celsius': '18', ...} or None → INT [0.01℃]"""
+    try:
+        v = int(round(float(t['celsius']) * 100))
+    except (TypeError, KeyError, ValueError):
+        return NO_TEMP
+    return v if -32767 <= v <= 32767 else NO_TEMP
+
+
+def _to_rain(s):
+    """'10%' / '--%' / None → INT"""
+    try:
+        v = int(str(s).rstrip('%'))
+    except ValueError:
+        return NO_RAIN
+    return v if 0 <= v <= 100 else NO_RAIN
+
+
+def _to_code(image):
+    """image.url の '.../100.svg' → UINT 100"""
+    try:
+        name = image['url'].rsplit('/', 1)[-1]
+        v = int(name.split('.', 1)[0])
+    except (TypeError, KeyError, ValueError, AttributeError):
+        return NO_CODE
+    return v if 0 < v <= 65535 else NO_CODE
+
+
+def _parse(data):
+    """API の JSON(dict) → 出力値の dict"""
+    forecasts = data['forecasts']
+    if len(forecasts) < 2:
+        raise ValueError('forecasts too short')
+    out = dict(_WEATHER_DEFAULT)
+    for d in range(3):
+        if d >= len(forecasts):
+            break
+        f = forecasts[d] or {}
+        out[f'uiCodeD{d}'] = _to_code(f.get('image'))
+        out[f'iTempMaxD{d}'] = _to_temp((f.get('temperature') or {}).get('max'))
+        if d < 2:
+            rain = f.get('chanceOfRain') or {}
+            for slot, key in _RAIN_SLOTS:
+                out[f'iRainD{d}_{slot}'] = _to_rain(rain.get(key))
+    return out
+
+
+# ---- インターロック ------------------------------------------------------
+def _load_last_send():
+    try:
+        with open(LAST_SEND_FILE) as fp:
+            return float(fp.read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _save_last_send(t):
+    try:
+        with open(LAST_SEND_FILE, 'w') as fp:
+            fp.write(str(t))
+    except OSError:
+        pass
+
+
+def _remain():
+    r = MIN_INTERVAL_S - (time.time() - _last_send)
+    # 時計が戻った場合も最大 MIN_INTERVAL_S 待てば解除される
+    return int(min(max(r, 0.0), MIN_INTERVAL_S) + 0.999)
+
+
+# ---- 通信 (別スレッド) ---------------------------------------------------
+def _set_error(code):
+    with _lock:
+        _state['xValid'] = False
+        _state['xError'] = True
+        _state['iErrorCode'] = code
+
+
+def _fetch(city_id):
+    global _busy
+    try:
+        req = urllib.request.Request(
+            API_URL.format(city_id),
+            headers={'User-Agent': USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as res:
+                body = res.read()
+        except urllib.error.HTTPError as e:
+            print(f'FB_GetWeather: HTTP {e.code}', flush=True)
+            _set_error(ERR_HTTP)
+            return
+        except Exception as e:  # URLError, timeout, socket error など
+            print(f'FB_GetWeather: network error: {e}', flush=True)
+            _set_error(ERR_NETWORK)
+            return
+
+        try:
+            values = _parse(json.loads(body.decode('utf-8')))
+        except Exception as e:
+            print(f'FB_GetWeather: parse error: {e}', flush=True)
+            _set_error(ERR_PARSE)
+            return
+
+        with _lock:
+            _state.update(values)
+            _state['xValid'] = True
+            _state['xError'] = False
+            _state['iErrorCode'] = ERR_OK
+            _state['udUpdateCount'] = (_state['udUpdateCount'] + 1) & 0xFFFFFFFF
+        print(f'FB_GetWeather: updated id={city_id:06d} '
+              f'code={values["uiCodeD0"]}/{values["uiCodeD1"]}/{values["uiCodeD2"]}', flush=True)
+    finally:
+        with _lock:
+            _busy = False
+
+
+def _request(city_id):
+    """立ち上がり検出時に呼ぶ。インターロック・通信中なら何もしない"""
+    global _busy, _last_send
+    if not (1 <= city_id <= 999999):
+        _set_error(ERR_BAD_ID)
+        return
+    with _lock:
+        if _busy or _remain() > 0:
+            return
+        _busy = True
+        _last_send = time.time()      # 失敗してもインターロックをかける
+    _save_last_send(_last_send)
+    threading.Thread(target=_fetch, args=(city_id,), daemon=True).start()
+
+
+# ---- OpenPLC Python FB エントリ ----------------------------------------
+def block_init():
+    global _last_send
+    _last_send = _load_last_send()
+    print(f'FB_GetWeather: initialized (min interval {MIN_INTERVAL_S}s)', flush=True)
+
+
+def block_loop():
+    global _prev_trig
+    global xBusy, xValid, xError, iErrorCode, xInterlock, iInterlockRemain, udUpdateCount
+    global uiCodeD0, uiCodeD1, uiCodeD2
+    global iTempMaxD0, iTempMaxD1, iTempMaxD2
+    global iRainD0_00, iRainD0_06, iRainD0_12, iRainD0_18
+    global iRainD1_00, iRainD1_06, iRainD1_12, iRainD1_18
+
+    trig = bool(xTrig)
+    # 起動直後に xTrig が既に TRUE でも送信しない (起動のたびに通信するのを防ぐ)
+    if _prev_trig is not None and trig and not _prev_trig:
+        _request(int(udID))
+    _prev_trig = trig
+
+    with _lock:
+        remain = _remain()
+        xBusy            = _busy
+        xValid           = _state['xValid']
+        xError           = _state['xError']
+        iErrorCode       = _state['iErrorCode']
+        xInterlock       = remain > 0
+        iInterlockRemain = remain
+        udUpdateCount    = _state['udUpdateCount']
+
+        uiCodeD0   = _state['uiCodeD0']
+        uiCodeD1   = _state['uiCodeD1']
+        uiCodeD2   = _state['uiCodeD2']
+        iTempMaxD0 = _state['iTempMaxD0']
+        iTempMaxD1 = _state['iTempMaxD1']
+        iTempMaxD2 = _state['iTempMaxD2']
+
+        iRainD0_00 = _state['iRainD0_00']
+        iRainD0_06 = _state['iRainD0_06']
+        iRainD0_12 = _state['iRainD0_12']
+        iRainD0_18 = _state['iRainD0_18']
+        iRainD1_00 = _state['iRainD1_00']
+        iRainD1_06 = _state['iRainD1_06']
+        iRainD1_12 = _state['iRainD1_12']
+        iRainD1_18 = _state['iRainD1_18']]]></xhtml:p>
+          </ST>
+        </body>
+        <documentation>
+          <xhtml:p><![CDATA[ ]]></xhtml:p>
+        </documentation>
+      </pou>
+      <pou name="FB_UtcToJst" pouType="functionBlock">
+        <interface>
+          <inputVars>
+            <variable name="dtUTC">
+              <type>
+                <DT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[現在時刻 (UTC)]]></xhtml:p>
+              </documentation>
+            </variable>
+          </inputVars>
+          <outputVars>
+            <variable name="iYear">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[年 (例: 2026)]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iMonth">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[月 1-12]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iDay">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[日 1-31]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iHour">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[時 0-23]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iMinute">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[分 0-59]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iSecond">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[秒 0-59]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="iWeekday">
+              <type>
+                <INT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[曜日 0=日 ... 6=土]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="xValid">
+              <type>
+                <BOOL/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[変換結果が有効 (1970年より前の時刻なら FALSE)]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="lRawDT">
+              <type>
+                <LINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[確認用: DT_TO_LINT の生の値]]></xhtml:p>
+              </documentation>
+            </variable>
+          </outputVars>
+          <localVars>
+            <variable name="JST_OFFSET_S">
+              <type>
+                <LINT/>
+              </type>
+              <initialValue>
+                <simpleValue value="32400"/>
+              </initialValue>
+              <documentation>
+                <xhtml:p><![CDATA[9時間 [秒]]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="lSec">
+              <type>
+                <LINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[JST の経過秒]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="lDays">
+              <type>
+                <LINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[JST の経過日数]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="lSecOfDay">
+              <type>
+                <LINT/>
+              </type>
+              <documentation>
+                <xhtml:p><![CDATA[その日の 0:00 からの秒]]></xhtml:p>
+              </documentation>
+            </variable>
+            <variable name="z">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="era">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="doe">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="yoe">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="doy">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="mp">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="y">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="m">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+            <variable name="d">
+              <type>
+                <LINT/>
+              </type>
+            </variable>
+          </localVars>
+        </interface>
+        <body>
+          <ST>
+            <xhtml:p><![CDATA[(*
+  FB_UtcToJst
+  UTC の DT を日本時間 (JST = UTC+9, サマータイムなし) の年月日・時分秒・曜日に分解する。
+  DT_TO_LINT と整数計算のみ使用。
+  DT の内部単位 (秒/ミリ秒/マイクロ秒/ナノ秒) は値の桁から自動判定する。
+  (1973年〜5000年頃の範囲なら単位ごとの桁が重ならない)
+ 
+  曜日コード: 0=日 1=月 2=火 3=水 4=木 5=金 6=土
+  日付計算: Howard Hinnant の civil_from_days (グレゴリオ暦, うるう年対応)
+*)
+  // 1970-01-01 00:00:00 UTC からの経過値 → 秒
+  lRawDT := DT_TO_LINT(dtUTC);
+  IF lRawDT >= 100000000000000000 THEN        // ナノ秒
+    lSec := lRawDT / 1000000000;
+  ELSIF lRawDT >= 100000000000000 THEN        // マイクロ秒
+    lSec := lRawDT / 1000000;
+  ELSIF lRawDT >= 100000000000 THEN           // ミリ秒
+    lSec := lRawDT / 1000;
+  ELSE                                        // 秒
+    lSec := lRawDT;
+  END_IF;
+  lSec := lSec + JST_OFFSET_S;
+ 
+  xValid := lSec >= 0;
+  IF NOT xValid THEN
+    RETURN;
+  END_IF;
+ 
+  // 時刻
+  lDays     := lSec / 86400;
+  lSecOfDay := lSec MOD 86400;
+  iHour   := LINT_TO_INT(lSecOfDay / 3600);
+  iMinute := LINT_TO_INT((lSecOfDay MOD 3600) / 60);
+  iSecond := LINT_TO_INT(lSecOfDay MOD 60);
+ 
+  // 曜日 (1970-01-01 は木曜 = 4)
+  iWeekday := LINT_TO_INT((lDays + 4) MOD 7);
+ 
+  // 日付 (3月始まりの暦で計算してから1月始まりに戻す)
+  z   := lDays + 719468;
+  era := z / 146097;
+  doe := z - era * 146097;                                         // 0..146096
+  yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;    // 0..399
+  y   := yoe + era * 400;
+  doy := doe - (365 * yoe + yoe / 4 - yoe / 100);                  // 0..365
+  mp  := (5 * doy + 2) / 153;                                      // 0..11 (0=3月)
+  d   := doy - (153 * mp + 2) / 5 + 1;
+  IF mp < 10 THEN
+    m := mp + 3;
+  ELSE
+    m := mp - 9;
+  END_IF;
+  IF m <= 2 THEN
+    y := y + 1;
+  END_IF;
+ 
+  iYear  := LINT_TO_INT(y);
+  iMonth := LINT_TO_INT(m);
+  iDay   := LINT_TO_INT(d);]]></xhtml:p>
+          </ST>
+        </body>
+        <documentation>
+          <xhtml:p><![CDATA[ ]]></xhtml:p>
+        </documentation>
+      </pou>
+      <pou name="main" pouType="program">
+        <interface>
+          <localVars>
+            <variable name="instFB_GetGamepad">
+              <type>
+                <derived name="FB_GetGamepad"/>
+              </type>
+            </variable>
+            <variable name="TON0">
+              <type>
+                <derived name="TON"/>
+              </type>
+            </variable>
+            <variable name="TOF0">
+              <type>
+                <derived name="TOF"/>
+              </type>
+            </variable>
+            <variable name="isBlink">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="btn_1">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="btn_2">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="lamp">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="instGetWeather">
+              <type>
+                <derived name="FB_GetWeather"/>
+              </type>
+            </variable>
+            <variable name="wetherID">
+              <type>
+                <UDINT/>
+              </type>
+              <initialValue>
+                <simpleValue value="250010"/>
+              </initialValue>
+            </variable>
+            <variable name="debg">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="CurrentDT">
+              <type>
+                <DT/>
+              </type>
+            </variable>
+            <variable name="instUtcToJst">
+              <type>
+                <derived name="FB_UtcToJst"/>
+              </type>
+            </variable>
+            <variable name="getFlag">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="sec">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="sec10">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="TON1">
+              <type>
+                <derived name="TON"/>
+              </type>
+            </variable>
+            <variable name="TOF1">
+              <type>
+                <derived name="TOF"/>
+              </type>
+            </variable>
+            <variable name="alwaysTrue">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="isInitial">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="TP0">
+              <type>
+                <derived name="TP"/>
+              </type>
+            </variable>
+            <variable name="TON2">
+              <type>
+                <derived name="TON"/>
+              </type>
+            </variable>
+            <variable name="preID">
+              <type>
+                <UDINT/>
+              </type>
+            </variable>
+            <variable name="isIdChange">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+          </localVars>
+          <externalVars>
+            <variable name="gAreaID">
+              <type>
+                <UDINT/>
+              </type>
+            </variable>
+            <variable name="gYear">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="gMonth">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="gDay">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="gHour">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="gMinute">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="gWeek">
+              <type>
+                <INT/>
+              </type>
+            </variable>
+            <variable name="gWethCode">
+              <type>
+                <array>
+                  <dimension lower="0" upper="2"/>
+                  <baseType>
+                    <UINT/>
+                  </baseType>
+                </array>
+              </type>
+            </variable>
+            <variable name="gWethTemp">
+              <type>
+                <array>
+                  <dimension lower="0" upper="2"/>
+                  <baseType>
+                    <INT/>
+                  </baseType>
+                </array>
+              </type>
+            </variable>
+            <variable name="gWethRain">
+              <type>
+                <array>
+                  <dimension lower="0" upper="7"/>
+                  <baseType>
+                    <INT/>
+                  </baseType>
+                </array>
+              </type>
+            </variable>
+            <variable name="gFlicker">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="gApiValid">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+            <variable name="gApiError">
+              <type>
+                <BOOL/>
+              </type>
+            </variable>
+          </externalVars>
+        </interface>
+        <body>
+          <LD>
+            <leftPowerRail localId="6798440" width="3" height="40">
+              <position x="0" y="30"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <leftPowerRail localId="1605919" width="3" height="40">
+              <position x="0" y="256"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <leftPowerRail localId="5351439" width="3" height="40">
+              <position x="0" y="390"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <leftPowerRail localId="7982010" width="3" height="40">
+              <position x="0" y="564"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <leftPowerRail localId="7720416" width="3" height="40">
+              <position x="0" y="1258"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <leftPowerRail localId="1698726" width="3" height="40">
+              <position x="0" y="1712"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <leftPowerRail localId="7693607" width="3" height="40">
+              <position x="0" y="2606"/>
+              <connectionPointOut formalParameter="">
+                <relPosition x="3" y="20"/>
+              </connectionPointOut>
+            </leftPowerRail>
+            <rightPowerRail localId="912023" width="3" height="40">
+              <position x="822" y="30"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="1277694" formalParameter="output">
+                  <position x="297" y="50"/>
+                  <position x="100" y="50"/>
+                </connection>
+                <connection refLocalId="3291166" formalParameter="output">
+                  <position x="297" y="50"/>
+                  <position x="761" y="50"/>
+                  <position x="761" y="142"/>
+                  <position x="712" y="142"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <rightPowerRail localId="5885504" width="3" height="40">
+              <position x="932" y="256"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="3225856" formalParameter="output">
+                  <position x="297" y="276"/>
+                  <position x="822" y="276"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <rightPowerRail localId="9405414" width="3" height="40">
+              <position x="442" y="390"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="2364037" formalParameter="output">
+                  <position x="297" y="410"/>
+                  <position x="332" y="410"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <rightPowerRail localId="10161429" width="3" height="40">
+              <position x="703" y="564"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="6043949" formalParameter="ENO">
+                  <position x="297" y="584"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <rightPowerRail localId="6583283" width="3" height="40">
+              <position x="1601" y="1258"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="801519" formalParameter="ENO">
+                  <position x="297" y="1278"/>
+                  <position x="1011" y="1278"/>
+                </connection>
+                <connection refLocalId="7961360" formalParameter="ENO">
+                  <position x="297" y="1278"/>
+                  <position x="1465" y="1278"/>
+                  <position x="1465" y="1462"/>
+                  <position x="1341" y="1462"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <rightPowerRail localId="1909110" width="3" height="40">
+              <position x="741" y="1712"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="9362132" formalParameter="xBusy">
+                  <position x="297" y="1732"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <rightPowerRail localId="6686091" width="3" height="40">
+              <position x="497" y="2606"/>
+              <connectionPointIn>
+                <relPosition x="3" y="20"/>
+                <connection refLocalId="6578373" formalParameter="ENO">
+                  <position x="297" y="2626"/>
+                  <position x="237" y="2626"/>
+                </connection>
+                <connection refLocalId="575122" formalParameter="ENO">
+                  <position x="297" y="2626"/>
+                  <position x="361" y="2626"/>
+                  <position x="361" y="2810"/>
+                  <position x="225" y="2810"/>
+                </connection>
+              </connectionPointIn>
+            </rightPowerRail>
+            <block localId="6649232" typeName="TON" instanceName="TON2" width="66" height="100" executionOrderId="0">
+              <position x="147" y="106"/>
+              <inputVariables>
+                <variable formalParameter="IN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="6798440" formalParameter="left-rail">
+                      <position x="147" y="142"/>
+                      <position x="27" y="142"/>
+                      <position x="27" y="50"/>
+                      <position x="3" y="50"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="PT">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="7789752">
+                      <position x="147" y="182"/>
+                      <position x="197" y="182"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="Q">
+                  <connectionPointOut>
+                    <relPosition x="66" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="ET">
+                  <connectionPointOut>
+                    <relPosition x="66" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="2535564" typeName="TP" instanceName="TP0" width="66" height="100" executionOrderId="0">
+              <position x="453" y="106"/>
+              <inputVariables>
+                <variable formalParameter="IN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="6649232" formalParameter="Q">
+                      <position x="453" y="142"/>
+                      <position x="213" y="142"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="PT">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="6026979">
+                      <position x="453" y="182"/>
+                      <position x="503" y="182"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="Q">
+                  <connectionPointOut>
+                    <relPosition x="66" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="ET">
+                  <connectionPointOut>
+                    <relPosition x="66" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="8885064" typeName="TON" instanceName="TON1" width="66" height="100" executionOrderId="0">
+              <position x="257" y="240"/>
+              <inputVariables>
+                <variable formalParameter="IN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="6755676" formalParameter="output">
+                      <position x="257" y="276"/>
+                      <position x="92" y="276"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="PT">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="9804134">
+                      <position x="257" y="316"/>
+                      <position x="307" y="316"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="Q">
+                  <connectionPointOut>
+                    <relPosition x="66" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="ET">
+                  <connectionPointOut>
+                    <relPosition x="66" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="1877840" typeName="TOF" instanceName="TOF1" width="66" height="100" executionOrderId="0">
+              <position x="563" y="240"/>
+              <inputVariables>
+                <variable formalParameter="IN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="8885064" formalParameter="Q">
+                      <position x="563" y="276"/>
+                      <position x="323" y="276"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="PT">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="5335022">
+                      <position x="563" y="316"/>
+                      <position x="613" y="316"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="Q">
+                  <connectionPointOut>
+                    <relPosition x="66" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="ET">
+                  <connectionPointOut>
+                    <relPosition x="66" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="6043949" typeName="FB_GetGamepad" instanceName="instFB_GetGamepad" width="186" height="660" executionOrderId="0">
+              <position x="257" y="548"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="3154235" formalParameter="output">
+                      <position x="257" y="584"/>
+                      <position x="92" y="584"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="186" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="axis_lx">
+                  <connectionPointOut>
+                    <relPosition x="186" y="76"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="axis_ly">
+                  <connectionPointOut>
+                    <relPosition x="186" y="116"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="axis_rx">
+                  <connectionPointOut>
+                    <relPosition x="186" y="156"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="axis_ry">
+                  <connectionPointOut>
+                    <relPosition x="186" y="196"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="btn_cross">
+                  <connectionPointOut>
+                    <relPosition x="186" y="236"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="btn_circle">
+                  <connectionPointOut>
+                    <relPosition x="186" y="276"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="btn_square">
+                  <connectionPointOut>
+                    <relPosition x="186" y="316"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="btn_triangle">
+                  <connectionPointOut>
+                    <relPosition x="186" y="356"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="btn_l1">
+                  <connectionPointOut>
+                    <relPosition x="186" y="396"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="btn_r1">
+                  <connectionPointOut>
+                    <relPosition x="186" y="436"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="axis_l2">
+                  <connectionPointOut>
+                    <relPosition x="186" y="476"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="axis_r2">
+                  <connectionPointOut>
+                    <relPosition x="186" y="516"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="dpad_x">
+                  <connectionPointOut>
+                    <relPosition x="186" y="556"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="dpad_y">
+                  <connectionPointOut>
+                    <relPosition x="186" y="596"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="connected">
+                  <connectionPointOut>
+                    <relPosition x="186" y="636"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="2032477" typeName="CURRENT_DT" width="120" height="100" executionOrderId="0">
+              <position x="143" y="1242"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="7720416" formalParameter="left-rail">
+                      <position x="143" y="1278"/>
+                      <position x="3" y="1278"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="120" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="OUT">
+                  <connectionPointOut>
+                    <relPosition x="120" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="6759093" typeName="FB_UtcToJst" instanceName="instUtcToJst" width="174" height="420" executionOrderId="0">
+              <position x="503" y="1242"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="2032477" formalParameter="ENO">
+                      <position x="503" y="1278"/>
+                      <position x="263" y="1278"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="dtUTC">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="1773762">
+                      <position x="503" y="1318"/>
+                      <position x="553" y="1318"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="174" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iYear">
+                  <connectionPointOut>
+                    <relPosition x="174" y="76"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iMonth">
+                  <connectionPointOut>
+                    <relPosition x="174" y="116"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iDay">
+                  <connectionPointOut>
+                    <relPosition x="174" y="156"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iHour">
+                  <connectionPointOut>
+                    <relPosition x="174" y="196"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iMinute">
+                  <connectionPointOut>
+                    <relPosition x="174" y="236"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iSecond">
+                  <connectionPointOut>
+                    <relPosition x="174" y="276"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iWeekday">
+                  <connectionPointOut>
+                    <relPosition x="174" y="316"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="xValid">
+                  <connectionPointOut>
+                    <relPosition x="174" y="356"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="lRawDT">
+                  <connectionPointOut>
+                    <relPosition x="174" y="396"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="801519" typeName="EQ" width="90" height="140" executionOrderId="0">
+              <position x="921" y="1242"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="6759093" formalParameter="ENO">
+                      <position x="921" y="1278"/>
+                      <position x="677" y="1278"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN1">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="2866358">
+                      <position x="921" y="1318"/>
+                      <position x="971" y="1318"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN2">
+                  <connectionPointIn>
+                    <relPosition x="0" y="116"/>
+                    <connection refLocalId="5967527">
+                      <position x="921" y="1358"/>
+                      <position x="971" y="1358"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="90" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="OUT">
+                  <connectionPointOut>
+                    <relPosition x="90" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="6684188" typeName="MOD" width="90" height="140" executionOrderId="0">
+              <position x="921" y="1426"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="6759093" formalParameter="ENO">
+                      <position x="921" y="1462"/>
+                      <position x="801" y="1462"/>
+                      <position x="801" y="1278"/>
+                      <position x="677" y="1278"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN1">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="10435878">
+                      <position x="921" y="1502"/>
+                      <position x="971" y="1502"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN2">
+                  <connectionPointIn>
+                    <relPosition x="0" y="116"/>
+                    <connection refLocalId="1700125">
+                      <position x="921" y="1542"/>
+                      <position x="971" y="1542"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="90" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="OUT">
+                  <connectionPointOut>
+                    <relPosition x="90" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="7961360" typeName="GE" width="90" height="140" executionOrderId="0">
+              <position x="1251" y="1426"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="6684188" formalParameter="ENO">
+                      <position x="1251" y="1462"/>
+                      <position x="1011" y="1462"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN1">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="6829236">
+                      <position x="1251" y="1502"/>
+                      <position x="1301" y="1502"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN2">
+                  <connectionPointIn>
+                    <relPosition x="0" y="116"/>
+                    <connection refLocalId="6310556">
+                      <position x="1251" y="1542"/>
+                      <position x="1301" y="1542"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="90" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="OUT">
+                  <connectionPointOut>
+                    <relPosition x="90" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="9362132" typeName="FB_GetWeather" instanceName="instGetWeather" width="216" height="860" executionOrderId="0">
+              <position x="265" y="1696"/>
+              <inputVariables>
+                <variable formalParameter="xTrig">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="2331854" formalParameter="output">
+                      <position x="265" y="1732"/>
+                      <position x="96" y="1732"/>
+                    </connection>
+                    <connection refLocalId="5275053" formalParameter="output">
+                      <position x="265" y="1732"/>
+                      <position x="145" y="1732"/>
+                      <position x="145" y="1824"/>
+                      <position x="96" y="1824"/>
+                    </connection>
+                    <connection refLocalId="8278396" formalParameter="output">
+                      <position x="265" y="1732"/>
+                      <position x="145" y="1732"/>
+                      <position x="145" y="1916"/>
+                      <position x="96" y="1916"/>
+                    </connection>
+                    <connection refLocalId="1281662" formalParameter="output">
+                      <position x="265" y="1732"/>
+                      <position x="145" y="1732"/>
+                      <position x="145" y="2008"/>
+                      <position x="96" y="2008"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="udID">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="3490446">
+                      <position x="265" y="1772"/>
+                      <position x="315" y="1772"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="xBusy">
+                  <connectionPointOut>
+                    <relPosition x="216" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="xValid">
+                  <connectionPointOut>
+                    <relPosition x="216" y="76"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="xError">
+                  <connectionPointOut>
+                    <relPosition x="216" y="116"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iErrorCode">
+                  <connectionPointOut>
+                    <relPosition x="216" y="156"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="xInterlock">
+                  <connectionPointOut>
+                    <relPosition x="216" y="196"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iInterlockRemain">
+                  <connectionPointOut>
+                    <relPosition x="216" y="236"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="udUpdateCount">
+                  <connectionPointOut>
+                    <relPosition x="216" y="276"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="uiCodeD0">
+                  <connectionPointOut>
+                    <relPosition x="216" y="316"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="uiCodeD1">
+                  <connectionPointOut>
+                    <relPosition x="216" y="356"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="uiCodeD2">
+                  <connectionPointOut>
+                    <relPosition x="216" y="396"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iTempMaxD0">
+                  <connectionPointOut>
+                    <relPosition x="216" y="436"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iTempMaxD1">
+                  <connectionPointOut>
+                    <relPosition x="216" y="476"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iTempMaxD2">
+                  <connectionPointOut>
+                    <relPosition x="216" y="516"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD0_00">
+                  <connectionPointOut>
+                    <relPosition x="216" y="556"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD0_06">
+                  <connectionPointOut>
+                    <relPosition x="216" y="596"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD0_12">
+                  <connectionPointOut>
+                    <relPosition x="216" y="636"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD0_18">
+                  <connectionPointOut>
+                    <relPosition x="216" y="676"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD1_00">
+                  <connectionPointOut>
+                    <relPosition x="216" y="716"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD1_06">
+                  <connectionPointOut>
+                    <relPosition x="216" y="756"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD1_12">
+                  <connectionPointOut>
+                    <relPosition x="216" y="796"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="iRainD1_18">
+                  <connectionPointOut>
+                    <relPosition x="216" y="836"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="6578373" typeName="NE" width="90" height="140" executionOrderId="0">
+              <position x="147" y="2590"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="7693607" formalParameter="left-rail">
+                      <position x="147" y="2626"/>
+                      <position x="3" y="2626"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN1">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="1635263">
+                      <position x="147" y="2666"/>
+                      <position x="197" y="2666"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN2">
+                  <connectionPointIn>
+                    <relPosition x="0" y="116"/>
+                    <connection refLocalId="3765571">
+                      <position x="147" y="2706"/>
+                      <position x="197" y="2706"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="90" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="OUT">
+                  <connectionPointOut>
+                    <relPosition x="90" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <block localId="575122" typeName="MOVE" width="78" height="100" executionOrderId="0">
+              <position x="147" y="2774"/>
+              <inputVariables>
+                <variable formalParameter="EN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="36"/>
+                    <connection refLocalId="7693607" formalParameter="left-rail">
+                      <position x="147" y="2810"/>
+                      <position x="27" y="2810"/>
+                      <position x="27" y="2626"/>
+                      <position x="3" y="2626"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+                <variable formalParameter="IN">
+                  <connectionPointIn>
+                    <relPosition x="0" y="76"/>
+                    <connection refLocalId="1232453">
+                      <position x="147" y="2850"/>
+                      <position x="197" y="2850"/>
+                    </connection>
+                  </connectionPointIn>
+                </variable>
+              </inputVariables>
+              <inOutVariables/>
+              <outputVariables>
+                <variable formalParameter="ENO">
+                  <connectionPointOut>
+                    <relPosition x="78" y="36"/>
+                  </connectionPointOut>
+                </variable>
+                <variable formalParameter="OUT">
+                  <connectionPointOut>
+                    <relPosition x="78" y="76"/>
+                  </connectionPointOut>
+                </variable>
+              </outputVariables>
+            </block>
+            <contact localId="6755676" negated="true" width="24" height="24">
+              <position x="68" y="264"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="1605919" formalParameter="left-rail">
+                  <position x="68" y="276"/>
+                  <position x="3" y="276"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>isBlink</variable>
+            </contact>
+            <contact localId="3091103" negated="false" width="24" height="24">
+              <position x="72" y="398"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="5351439" formalParameter="left-rail">
+                  <position x="72" y="410"/>
+                  <position x="3" y="410"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>btn_1</variable>
+            </contact>
+            <contact localId="5386926" negated="false" width="24" height="24">
+              <position x="72" y="490"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="5351439" formalParameter="left-rail">
+                  <position x="72" y="502"/>
+                  <position x="27" y="502"/>
+                  <position x="27" y="410"/>
+                  <position x="3" y="410"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>lamp</variable>
+            </contact>
+            <contact localId="4764538" negated="true" width="24" height="24">
+              <position x="190" y="398"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="3091103" formalParameter="output">
+                  <position x="190" y="410"/>
+                  <position x="96" y="410"/>
+                </connection>
+                <connection refLocalId="5386926" formalParameter="output">
+                  <position x="190" y="410"/>
+                  <position x="145" y="410"/>
+                  <position x="145" y="502"/>
+                  <position x="96" y="502"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>btn_2</variable>
+            </contact>
+            <contact localId="3154235" negated="false" edge="rising" width="24" height="24">
+              <position x="68" y="572"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="7982010" formalParameter="left-rail">
+                  <position x="68" y="584"/>
+                  <position x="3" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>isBlink</variable>
+            </contact>
+            <contact localId="2331854" negated="false" width="24" height="24">
+              <position x="72" y="1720"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="1698726" formalParameter="left-rail">
+                  <position x="72" y="1732"/>
+                  <position x="3" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>getFlag</variable>
+            </contact>
+            <contact localId="5275053" negated="false" width="24" height="24">
+              <position x="72" y="1812"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="1698726" formalParameter="left-rail">
+                  <position x="72" y="1824"/>
+                  <position x="3" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>isInitial</variable>
+            </contact>
+            <contact localId="8278396" negated="false" width="24" height="24">
+              <position x="72" y="1904"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="1698726" formalParameter="left-rail">
+                  <position x="72" y="1916"/>
+                  <position x="27" y="1916"/>
+                  <position x="27" y="1732"/>
+                  <position x="3" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>isIdChange</variable>
+            </contact>
+            <contact localId="1281662" negated="false" width="24" height="24">
+              <position x="72" y="1996"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="1698726" formalParameter="left-rail">
+                  <position x="72" y="2008"/>
+                  <position x="27" y="2008"/>
+                  <position x="27" y="1732"/>
+                  <position x="3" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="24" y="12"/>
+              </connectionPointOut>
+              <variable>btn_1</variable>
+            </contact>
+            <coil localId="1277694" negated="false" width="28" height="24">
+              <position x="72" y="38"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="6798440" formalParameter="left-rail">
+                  <position x="72" y="50"/>
+                  <position x="3" y="50"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="28" y="12"/>
+              </connectionPointOut>
+              <variable>alwaysTrue</variable>
+            </coil>
+            <coil localId="3291166" negated="false" width="28" height="24">
+              <position x="684" y="130"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="2535564" formalParameter="Q">
+                  <position x="684" y="142"/>
+                  <position x="519" y="142"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="28" y="12"/>
+              </connectionPointOut>
+              <variable>isInitial</variable>
+            </coil>
+            <coil localId="3225856" negated="false" width="28" height="24">
+              <position x="794" y="264"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="1877840" formalParameter="Q">
+                  <position x="794" y="276"/>
+                  <position x="629" y="276"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="28" y="12"/>
+              </connectionPointOut>
+              <variable>isBlink</variable>
+            </coil>
+            <coil localId="2364037" negated="false" width="28" height="24">
+              <position x="304" y="398"/>
+              <connectionPointIn>
+                <relPosition x="0" y="12"/>
+                <connection refLocalId="4764538" formalParameter="output">
+                  <position x="304" y="410"/>
+                  <position x="214" y="410"/>
+                </connection>
+              </connectionPointIn>
+              <connectionPointOut>
+                <relPosition x="28" y="12"/>
+              </connectionPointOut>
+              <variable>lamp</variable>
+            </coil>
+            <inVariable localId="7789752" width="80" height="32" negated="false">
+              <position x="37" y="166"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>T#1s</expression>
+            </inVariable>
+            <inVariable localId="6026979" width="80" height="32" negated="false">
+              <position x="343" y="166"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>T#10s</expression>
+            </inVariable>
+            <inVariable localId="9804134" width="80" height="32" negated="false">
+              <position x="147" y="300"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>T#100ms</expression>
+            </inVariable>
+            <inVariable localId="5335022" width="80" height="32" negated="false">
+              <position x="453" y="300"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>T#100ms</expression>
+            </inVariable>
+            <inVariable localId="1773762" width="80" height="32" negated="false">
+              <position x="393" y="1302"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>CurrentDT</expression>
+            </inVariable>
+            <inVariable localId="2866358" width="80" height="32" negated="false">
+              <position x="811" y="1302"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>gMinute</expression>
+            </inVariable>
+            <inVariable localId="5967527" width="80" height="32" negated="false">
+              <position x="811" y="1342"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>0</expression>
+            </inVariable>
+            <inVariable localId="10435878" width="80" height="32" negated="false">
+              <position x="811" y="1486"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>sec</expression>
+            </inVariable>
+            <inVariable localId="1700125" width="80" height="32" negated="false">
+              <position x="811" y="1526"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>10</expression>
+            </inVariable>
+            <inVariable localId="6829236" width="80" height="32" negated="false">
+              <position x="1141" y="1486"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>sec10</expression>
+            </inVariable>
+            <inVariable localId="6310556" width="80" height="32" negated="false">
+              <position x="1141" y="1526"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>5</expression>
+            </inVariable>
+            <inVariable localId="3490446" width="80" height="32" negated="false">
+              <position x="155" y="1756"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>gAreaID</expression>
+            </inVariable>
+            <inVariable localId="1635263" width="80" height="32" negated="false">
+              <position x="37" y="2650"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>gAreaID</expression>
+            </inVariable>
+            <inVariable localId="3765571" width="80" height="32" negated="false">
+              <position x="37" y="2690"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>preID</expression>
+            </inVariable>
+            <inVariable localId="1232453" width="80" height="32" negated="false">
+              <position x="37" y="2834"/>
+              <connectionPointOut>
+                <relPosition x="80" y="16"/>
+              </connectionPointOut>
+              <expression>gAreaID</expression>
+            </inVariable>
+            <outVariable localId="648865" width="80" height="32" negated="false">
+              <position x="243" y="166"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6649232" formalParameter="ET">
+                  <position x="243" y="182"/>
+                  <position x="213" y="142"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="7072845" width="80" height="32" negated="false">
+              <position x="549" y="166"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="2535564" formalParameter="ET">
+                  <position x="549" y="182"/>
+                  <position x="519" y="142"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="6378330" width="80" height="32" negated="false">
+              <position x="353" y="300"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="8885064" formalParameter="ET">
+                  <position x="353" y="316"/>
+                  <position x="323" y="276"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="345115" width="80" height="32" negated="false">
+              <position x="659" y="300"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="1877840" formalParameter="ET">
+                  <position x="659" y="316"/>
+                  <position x="629" y="276"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="10469206" width="80" height="32" negated="false">
+              <position x="473" y="608"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="axis_lx">
+                  <position x="473" y="624"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="724854" width="80" height="32" negated="false">
+              <position x="473" y="648"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="axis_ly">
+                  <position x="473" y="664"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="8429468" width="80" height="32" negated="false">
+              <position x="473" y="688"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="axis_rx">
+                  <position x="473" y="704"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="2620338" width="80" height="32" negated="false">
+              <position x="473" y="728"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="axis_ry">
+                  <position x="473" y="744"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="1951440" width="80" height="32" negated="false">
+              <position x="473" y="768"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="btn_cross">
+                  <position x="473" y="784"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression>btn_1</expression>
+            </outVariable>
+            <outVariable localId="9068383" width="80" height="32" negated="false">
+              <position x="473" y="808"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="btn_circle">
+                  <position x="473" y="824"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression>btn_2</expression>
+            </outVariable>
+            <outVariable localId="4802417" width="80" height="32" negated="false">
+              <position x="473" y="848"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="btn_square">
+                  <position x="473" y="864"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="7018345" width="80" height="32" negated="false">
+              <position x="473" y="888"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="btn_triangle">
+                  <position x="473" y="904"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="4110880" width="80" height="32" negated="false">
+              <position x="473" y="928"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="btn_l1">
+                  <position x="473" y="944"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="4578961" width="80" height="32" negated="false">
+              <position x="473" y="968"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="btn_r1">
+                  <position x="473" y="984"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="7260096" width="80" height="32" negated="false">
+              <position x="473" y="1008"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="axis_l2">
+                  <position x="473" y="1024"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="4115754" width="80" height="32" negated="false">
+              <position x="473" y="1048"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="axis_r2">
+                  <position x="473" y="1064"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="5182379" width="80" height="32" negated="false">
+              <position x="473" y="1088"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="dpad_x">
+                  <position x="473" y="1104"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="7173273" width="80" height="32" negated="false">
+              <position x="473" y="1128"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="dpad_y">
+                  <position x="473" y="1144"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="1921747" width="80" height="32" negated="false">
+              <position x="473" y="1168"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6043949" formalParameter="connected">
+                  <position x="473" y="1184"/>
+                  <position x="443" y="584"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="6472387" width="80" height="32" negated="false">
+              <position x="293" y="1302"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="2032477" formalParameter="OUT">
+                  <position x="293" y="1318"/>
+                  <position x="263" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>CurrentDT</expression>
+            </outVariable>
+            <outVariable localId="6957327" width="80" height="32" negated="false">
+              <position x="707" y="1302"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iYear">
+                  <position x="707" y="1318"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gYear</expression>
+            </outVariable>
+            <outVariable localId="10503509" width="80" height="32" negated="false">
+              <position x="707" y="1342"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iMonth">
+                  <position x="707" y="1358"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gMonth</expression>
+            </outVariable>
+            <outVariable localId="4629159" width="80" height="32" negated="false">
+              <position x="707" y="1382"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iDay">
+                  <position x="707" y="1398"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gDay</expression>
+            </outVariable>
+            <outVariable localId="8986599" width="80" height="32" negated="false">
+              <position x="707" y="1422"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iHour">
+                  <position x="707" y="1438"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gHour</expression>
+            </outVariable>
+            <outVariable localId="8466535" width="80" height="32" negated="false">
+              <position x="707" y="1462"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iMinute">
+                  <position x="707" y="1478"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gMinute</expression>
+            </outVariable>
+            <outVariable localId="5380070" width="80" height="32" negated="false">
+              <position x="707" y="1502"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iSecond">
+                  <position x="707" y="1518"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>sec</expression>
+            </outVariable>
+            <outVariable localId="6270507" width="80" height="32" negated="false">
+              <position x="707" y="1542"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="iWeekday">
+                  <position x="707" y="1558"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWeek</expression>
+            </outVariable>
+            <outVariable localId="10116873" width="80" height="32" negated="false">
+              <position x="707" y="1582"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="xValid">
+                  <position x="707" y="1598"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="6309658" width="80" height="32" negated="false">
+              <position x="707" y="1622"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6759093" formalParameter="lRawDT">
+                  <position x="707" y="1638"/>
+                  <position x="677" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="5654281" width="80" height="32" negated="false">
+              <position x="1041" y="1302"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="801519" formalParameter="OUT">
+                  <position x="1041" y="1318"/>
+                  <position x="1011" y="1278"/>
+                </connection>
+              </connectionPointIn>
+              <expression>getFlag</expression>
+            </outVariable>
+            <outVariable localId="5358513" width="80" height="32" negated="false">
+              <position x="1041" y="1486"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6684188" formalParameter="OUT">
+                  <position x="1041" y="1502"/>
+                  <position x="1011" y="1462"/>
+                </connection>
+              </connectionPointIn>
+              <expression>sec10</expression>
+            </outVariable>
+            <outVariable localId="9996196" width="80" height="32" negated="false">
+              <position x="1371" y="1486"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="7961360" formalParameter="OUT">
+                  <position x="1371" y="1502"/>
+                  <position x="1341" y="1462"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gFlicker</expression>
+            </outVariable>
+            <outVariable localId="9338449" width="80" height="32" negated="false">
+              <position x="511" y="1756"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="xValid">
+                  <position x="511" y="1772"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gApiValid</expression>
+            </outVariable>
+            <outVariable localId="7321542" width="80" height="32" negated="false">
+              <position x="511" y="1796"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="xError">
+                  <position x="511" y="1812"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gApiError</expression>
+            </outVariable>
+            <outVariable localId="4471347" width="80" height="32" negated="false">
+              <position x="511" y="1836"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iErrorCode">
+                  <position x="511" y="1852"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="2512218" width="80" height="32" negated="false">
+              <position x="511" y="1876"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="xInterlock">
+                  <position x="511" y="1892"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="1899269" width="80" height="32" negated="false">
+              <position x="511" y="1916"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iInterlockRemain">
+                  <position x="511" y="1932"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="3084827" width="80" height="32" negated="false">
+              <position x="511" y="1956"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="udUpdateCount">
+                  <position x="511" y="1972"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression/>
+            </outVariable>
+            <outVariable localId="786541" width="80" height="32" negated="false">
+              <position x="511" y="1996"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="uiCodeD0">
+                  <position x="511" y="2012"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethCode[0]</expression>
+            </outVariable>
+            <outVariable localId="6891033" width="80" height="32" negated="false">
+              <position x="511" y="2036"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="uiCodeD1">
+                  <position x="511" y="2052"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethCode[1]</expression>
+            </outVariable>
+            <outVariable localId="10124326" width="80" height="32" negated="false">
+              <position x="511" y="2076"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="uiCodeD2">
+                  <position x="511" y="2092"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethCode[2]</expression>
+            </outVariable>
+            <outVariable localId="3030826" width="80" height="32" negated="false">
+              <position x="511" y="2116"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iTempMaxD0">
+                  <position x="511" y="2132"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethTemp[0]</expression>
+            </outVariable>
+            <outVariable localId="9705586" width="80" height="32" negated="false">
+              <position x="511" y="2156"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iTempMaxD1">
+                  <position x="511" y="2172"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethTemp[1]</expression>
+            </outVariable>
+            <outVariable localId="8006442" width="80" height="32" negated="false">
+              <position x="511" y="2196"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iTempMaxD2">
+                  <position x="511" y="2212"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethTemp[2]</expression>
+            </outVariable>
+            <outVariable localId="3744191" width="80" height="32" negated="false">
+              <position x="511" y="2236"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD0_00">
+                  <position x="511" y="2252"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[0]</expression>
+            </outVariable>
+            <outVariable localId="3207119" width="80" height="32" negated="false">
+              <position x="511" y="2276"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD0_06">
+                  <position x="511" y="2292"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[1]</expression>
+            </outVariable>
+            <outVariable localId="6416878" width="80" height="32" negated="false">
+              <position x="511" y="2316"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD0_12">
+                  <position x="511" y="2332"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[2]</expression>
+            </outVariable>
+            <outVariable localId="514537" width="80" height="32" negated="false">
+              <position x="511" y="2356"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD0_18">
+                  <position x="511" y="2372"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[3]</expression>
+            </outVariable>
+            <outVariable localId="10319695" width="80" height="32" negated="false">
+              <position x="511" y="2396"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD1_00">
+                  <position x="511" y="2412"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[4]</expression>
+            </outVariable>
+            <outVariable localId="6480394" width="80" height="32" negated="false">
+              <position x="511" y="2436"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD1_06">
+                  <position x="511" y="2452"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[5]</expression>
+            </outVariable>
+            <outVariable localId="2939952" width="80" height="32" negated="false">
+              <position x="511" y="2476"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD1_12">
+                  <position x="511" y="2492"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[6]</expression>
+            </outVariable>
+            <outVariable localId="7505777" width="80" height="32" negated="false">
+              <position x="511" y="2516"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="9362132" formalParameter="iRainD1_18">
+                  <position x="511" y="2532"/>
+                  <position x="481" y="1732"/>
+                </connection>
+              </connectionPointIn>
+              <expression>gWethRain[7]</expression>
+            </outVariable>
+            <outVariable localId="9243639" width="80" height="32" negated="false">
+              <position x="267" y="2650"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="6578373" formalParameter="OUT">
+                  <position x="267" y="2666"/>
+                  <position x="237" y="2626"/>
+                </connection>
+              </connectionPointIn>
+              <expression>isIdChange</expression>
+            </outVariable>
+            <outVariable localId="860651" width="80" height="32" negated="false">
+              <position x="255" y="2834"/>
+              <connectionPointIn>
+                <relPosition x="0" y="16"/>
+                <connection refLocalId="575122" formalParameter="OUT">
+                  <position x="255" y="2850"/>
+                  <position x="225" y="2810"/>
+                </connection>
+              </connectionPointIn>
+              <expression>preID</expression>
+            </outVariable>
+          </LD>
+        </body>
+        <documentation>
+          <xhtml:p><![CDATA[ ]]></xhtml:p>
+        </documentation>
+      </pou>
+    </pous>
+  </types>
+  <instances>
+    <configurations>
+      <configuration name="Config0">
+        <resource name="Res0">
+          <task name="task0" priority="1" interval="T#20ms">
+            <pouInstance name="instance0" typeName="main"/>
+          </task>
+        </resource>
+        <globalVars>
+          <variable name="gYear" address="%QW0">
+            <type>
+              <INT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gMonth" address="%QW1">
+            <type>
+              <INT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gDay" address="%QW2">
+            <type>
+              <INT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gHour" address="%QW3">
+            <type>
+              <INT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gMinute" address="%QW4">
+            <type>
+              <INT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gWeek" address="%QW5">
+            <type>
+              <INT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gFlicker" address="%QX0.0">
+            <type>
+              <BOOL/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gApiValid" address="%QX0.1">
+            <type>
+              <BOOL/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gApiError" address="%QX0.2">
+            <type>
+              <BOOL/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gWethCode" address="%QW8">
+            <type>
+              <array>
+                <dimension lower="0" upper="2"/>
+                <baseType>
+                  <UINT/>
+                </baseType>
+              </array>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gWethTemp" address="%QW12">
+            <type>
+              <array>
+                <dimension lower="0" upper="2"/>
+                <baseType>
+                  <INT/>
+                </baseType>
+              </array>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gWethRain" address="%QW16">
+            <type>
+              <array>
+                <dimension lower="0" upper="7"/>
+                <baseType>
+                  <INT/>
+                </baseType>
+              </array>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[ ]]></xhtml:p>
+            </documentation>
+          </variable>
+          <variable name="gAreaID" address="%MD0">
+            <type>
+              <UDINT/>
+            </type>
+            <documentation>
+              <xhtml:p><![CDATA[初期値：東京]]></xhtml:p>
+            </documentation>
+          </variable>
+        </globalVars>
+      </configuration>
+    </configurations>
+  </instances>
+  <addData>
+    <data name="openplc.org/library-blocks" handleUnknown="discard">
+      <libraryBlocks>
+        <pou name="CURRENT_DT" pouType="function">
+          <interface>
+            <returnType>
+              <DT/>
+            </returnType>
+          </interface>
+        </pou>
+        <pou name="EQ" pouType="function" extensible="true">
+          <interface>
+            <returnType>
+              <BOOL/>
+            </returnType>
+            <inputVars>
+              <variable name="IN1">
+                <type>
+                  <ANY_ELEMENTARY/>
+                </type>
+              </variable>
+              <variable name="IN2">
+                <type>
+                  <ANY_ELEMENTARY/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="GE" pouType="function" extensible="true">
+          <interface>
+            <returnType>
+              <BOOL/>
+            </returnType>
+            <inputVars>
+              <variable name="IN1">
+                <type>
+                  <ANY_ELEMENTARY/>
+                </type>
+              </variable>
+              <variable name="IN2">
+                <type>
+                  <ANY_ELEMENTARY/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="MOD" pouType="function">
+          <interface>
+            <returnType>
+              <ANY_NUM/>
+            </returnType>
+            <inputVars>
+              <variable name="IN1">
+                <type>
+                  <ANY_NUM/>
+                </type>
+              </variable>
+              <variable name="IN2">
+                <type>
+                  <ANY_NUM/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="MOVE" pouType="function">
+          <interface>
+            <returnType>
+              <ANY/>
+            </returnType>
+            <inputVars>
+              <variable name="IN">
+                <type>
+                  <ANY/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="NE" pouType="function" extensible="true">
+          <interface>
+            <returnType>
+              <BOOL/>
+            </returnType>
+            <inputVars>
+              <variable name="IN1">
+                <type>
+                  <ANY_ELEMENTARY/>
+                </type>
+              </variable>
+              <variable name="IN2">
+                <type>
+                  <ANY_ELEMENTARY/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="TOF" pouType="functionBlock">
+          <interface>
+            <outputVars>
+              <variable name="Q">
+                <type>
+                  <BOOL/>
+                </type>
+              </variable>
+              <variable name="ET">
+                <type>
+                  <TIME/>
+                </type>
+              </variable>
+            </outputVars>
+            <inputVars>
+              <variable name="IN">
+                <type>
+                  <BOOL/>
+                </type>
+              </variable>
+              <variable name="PT">
+                <type>
+                  <TIME/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="TON" pouType="functionBlock">
+          <interface>
+            <outputVars>
+              <variable name="Q">
+                <type>
+                  <BOOL/>
+                </type>
+              </variable>
+              <variable name="ET">
+                <type>
+                  <TIME/>
+                </type>
+              </variable>
+            </outputVars>
+            <inputVars>
+              <variable name="IN">
+                <type>
+                  <BOOL/>
+                </type>
+              </variable>
+              <variable name="PT">
+                <type>
+                  <TIME/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+        <pou name="TP" pouType="functionBlock">
+          <interface>
+            <outputVars>
+              <variable name="Q">
+                <type>
+                  <BOOL/>
+                </type>
+              </variable>
+              <variable name="ET">
+                <type>
+                  <TIME/>
+                </type>
+              </variable>
+            </outputVars>
+            <inputVars>
+              <variable name="IN">
+                <type>
+                  <BOOL/>
+                </type>
+              </variable>
+              <variable name="PT">
+                <type>
+                  <TIME/>
+                </type>
+              </variable>
+            </inputVars>
+          </interface>
+        </pou>
+      </libraryBlocks>
+    </data>
+  </addData>
+</project>
